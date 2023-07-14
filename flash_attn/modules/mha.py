@@ -522,7 +522,6 @@ class MHA(nn.Module):
                 if inference_params is None:
                     qkv = self.Wqkv(x)
                     qkv = rearrange(qkv, '... (three h d) -> ... three h d', three=3, d=self.head_dim)
-                    print(f"self-attn layer={self.layer_idx} cache=False qkv={qkv.shape}")
                 else:
                     # for self attention, the idea is to only run forward pass on last token
                     # and then for all q, k and v, take previous computation from cache and concatenate
@@ -530,13 +529,11 @@ class MHA(nn.Module):
                         qkv = self.Wqkv(x)
                         qkv = rearrange(qkv, '... (three h d) -> ... three h d', three=3, d=self.head_dim)
                         _update_kv_cache_simple(qkv, inference_params, self.layer_idx, kv_only=False)
-                        print(f"self-attn layer={self.layer_idx} cache=True qkv={qkv.shape}")
                     else:
                         x_last_token = x[:, -1, :].unsqueeze(1)
                         qkv_last_token = self.Wqkv(x_last_token)
                         qkv_last_token = rearrange(qkv_last_token, '... (three h d) -> ... three h d', three=3, d=self.head_dim)
                         qkv = _update_kv_cache_simple(qkv_last_token, inference_params, self.layer_idx, kv_only=False)
-                        print(f"self-attn layer={self.layer_idx} cache=True qkv={qkv.shape}")
                     
             else:
                 # TODO: consider kv-cache optimization for this case
@@ -595,16 +592,13 @@ class MHA(nn.Module):
                 if inference_params is None:
                     kv = self.Wkv(x_kv if x_kv is not None else x)
                     kv = rearrange(kv, '... (two h d) -> ... two h d', two=2, d=self.head_dim)
-                    print(f"cross-attn layer={self.layer_idx} cache=False kv={kv.shape}")
                 else:
                     if self.layer_idx not in inference_params.key_value_memory_dict:
                         kv = self.Wkv(x_kv if x_kv is not None else x)
                         kv = rearrange(kv, '... (two h d) -> ... two h d', two=2, d=self.head_dim)
                         inference_params.key_value_memory_dict[self.layer_idx] = kv
-                        print(f"cross-attn layer={self.layer_idx} cache=True kv={kv.shape}")
                     else:
                         kv = inference_params.key_value_memory_dict[self.layer_idx]
-                        print(f"cross-attn layer={self.layer_idx} cache=True kv={kv.shape}")
             else:
                 # TODO: consider kv-cache for residual case.
                 if x_kv is not None:
