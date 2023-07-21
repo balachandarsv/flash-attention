@@ -248,8 +248,7 @@ class LinearResidual(nn.Linear):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return super().forward(input), input
-
-
+    
 def _update_kv_cache(kv, inference_params, layer_idx):
     """kv: (batch_size, seqlen, 2, nheads, head_dim) or (batch_size, 1, 2, nheads, head_dim)
     """
@@ -302,6 +301,46 @@ def _update_kv_cache(kv, inference_params, layer_idx):
                 kv[:, :, 1], 'b s h d -> b h s d'
             )
         return kv
+
+
+def _update_kv_cache_simple(kv, inference_params, layer_idx, kv_only=True):
+    """
+    TODO: duplicate function. refactor later.
+    TODO: does not have FasterTransformer support.
+
+    Use this simple write-cache function to avoid dynamic malloc.
+    kv_only: 
+        if true, pass in kv of shape (batch_size, seqlen, 2, nheads, head_dim)
+        if false, pass in qkv of shape (batch_size, seqlen, 3, nheads, head_dim)
+        seqlen should be >= 1.
+    """
+    # Pre-allocate memory for key-values for inference.
+    num_heads, head_dim = kv.shape[-2:]
+    if layer_idx not in inference_params.key_value_memory_dict:
+        num_items = 2 if kv_only else 3
+        kv_cache = torch.empty(
+            inference_params.max_batch_size, inference_params.max_sequence_len, num_items,
+            num_heads, head_dim, dtype=kv.dtype, device=kv.device
+        )
+        inference_params.key_value_memory_dict[layer_idx] = kv_cache
+    else:
+        kv_cache = inference_params.key_value_memory_dict[layer_idx]
+    # Adjust key and value for inference
+    batch_start = inference_params.batch_size_offset
+    batch_end = batch_start + kv.shape[0]
+    sequence_start = inference_params.sequence_len_offset
+    sequence_end = sequence_start + kv.shape[1]
+    assert batch_end <= kv_cache.shape[0]
+    assert sequence_end <= kv_cache.shape[1]
+    # Copy key and values.
+    assert kv_cache is not None
+    kv_cache[batch_start:batch_end, sequence_start:sequence_end, ...] = kv
+
+    # NOTE: this is actually on for self-attn autoregressive case
+    # for cross-attn case which k-v is fixed from mem, this is not needed,
+    # and just need to retrieve from cache.
+    kv = kv_cache[batch_start:batch_end, :sequence_end, ...]
+    return kv
 
 
 class MHA(nn.Module):
@@ -441,13 +480,32 @@ class MHA(nn.Module):
         if not self.cross_attn:
             assert x_kv is None and mixer_subset is None
             if not self.return_residual:
-                qkv = self.Wqkv(x)
+                if inference_params is None:
+                    qkv = self.Wqkv(x)
+                    qkv = rearrange(qkv, '... (three h d) -> ... three h d', three=3, d=self.head_dim)
+                else:
+                    # for self attention, the idea is to only run forward pass on last token
+                    # and then for all q, k and v, take previous computation from cache and concatenate
+                    if self.layer_idx not in inference_params.key_value_memory_dict:
+                        qkv = self.Wqkv(x)
+                        qkv = rearrange(qkv, '... (three h d) -> ... three h d', three=3, d=self.head_dim)
+                        _update_kv_cache_simple(qkv, inference_params, self.layer_idx, kv_only=False)
+                    else:
+                        x_last_token = x[:, -1, :].unsqueeze(1)
+                        qkv_last_token = self.Wqkv(x_last_token)
+                        qkv_last_token = rearrange(qkv_last_token, '... (three h d) -> ... three h d', three=3, d=self.head_dim)
+                        qkv = _update_kv_cache_simple(qkv_last_token, inference_params, self.layer_idx, kv_only=False)
+                    
             else:
+                # TODO: consider kv-cache optimization for this case
                 qkv, x = self.Wqkv(x)
+                qkv = rearrange(qkv, '... (three h d) -> ... three h d', three=3, d=self.head_dim)
             if self.dwconv:
+                # TODO: consider kv-cache optimization for this case
                 qkv = rearrange(self.dwconv_qkv(rearrange(qkv, 'b s d -> b d s'))[..., :-2],
                                 'b d s -> b s d').contiguous()
-            qkv = rearrange(qkv, '... (three h d) -> ... three h d', three=3, d=self.head_dim)
+                qkv = rearrange(qkv, '... (three h d) -> ... three h d', three=3, d=self.head_dim)
+            
             if inference_params is None:
                 if self.rotary_emb_dim > 0:
                     qkv = self.rotary_emb(qkv)
@@ -460,7 +518,8 @@ class MHA(nn.Module):
                     if self.rotary_emb_dim > 0:
                         qkv = self.rotary_emb(qkv, seqlen_offset=inference_params.sequence_len_offset)
                     q = qkv[:, :, 0]
-                    kv = self._update_kv_cache(qkv[:, :, 1:], inference_params)
+                    kv = qkv[:, :, 1:]
+
                     # If we're processing the prompt, causal=None (use self.causal).
                     # If we're decoding, then causal=False.
                     causal = None if inference_params.sequence_len_offset == 0 else False
@@ -491,28 +550,41 @@ class MHA(nn.Module):
         else:
             if not self.return_residual:
                 q = self.Wq(x if mixer_subset is None else x[:, mixer_subset])
-                kv = self.Wkv(x_kv if x_kv is not None else x)
+                if inference_params is None:
+                    kv = self.Wkv(x_kv if x_kv is not None else x)
+                    kv = rearrange(kv, '... (two h d) -> ... two h d', two=2, d=self.head_dim)
+                else:
+                    if self.layer_idx not in inference_params.key_value_memory_dict:
+                        kv = self.Wkv(x_kv if x_kv is not None else x)
+                        kv = rearrange(kv, '... (two h d) -> ... two h d', two=2, d=self.head_dim)
+                        inference_params.key_value_memory_dict[self.layer_idx] = kv
+                    else:
+                        kv = inference_params.key_value_memory_dict[self.layer_idx]
             else:
+                # TODO: consider kv-cache for residual case.
                 if x_kv is not None:
                     kv, x_kv = self.Wkv(x_kv)
                 else:
                     kv, x = self.Wkv(x)
+                kv = rearrange(kv, '... (two h d) -> ... two h d', two=2, d=self.head_dim)
                 q = self.Wq(x if mixer_subset is None else x[:, mixer_subset])
             q = rearrange(q, '... (h d) -> ... h d', d=self.head_dim)
-            kv = rearrange(kv, '... (two h d) -> ... two h d', two=2, d=self.head_dim)
+            
             if self.dwconv:
+                # TODO: consider kv-cache for dwconv case.
                 q = rearrange(self.dwconv_q(rearrange(q, 'b s d -> b d s'))[..., :-2],
                               'b d s -> b s d').contiguous()
                 kv = rearrange(self.dwconv_kv(rearrange(kv, 'b s d -> b d s'))[..., :-2],
                                'b d s -> b s d').contiguous()
+            
             if inference_params is None:
                 if not self.checkpointing:
                     context = self.inner_cross_attn(q, kv, **kwargs)
                 else:
                     context = torch.utils.checkpoint.checkpoint(self.inner_cross_attn, q, kv, **kwargs)
             else:
-                kv = self._update_kv_cache(kv)
-                context = self.inner_cross_attn(q, kv, causal=False)
+                context = self.inner_cross_attn(q, kv, causal=self.causal)
+        
         out = self.out_proj(rearrange(context, '... h d -> ... (h d)'))
         return out if not self.return_residual else (out, x)
 
